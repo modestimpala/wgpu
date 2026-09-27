@@ -2699,6 +2699,7 @@ impl super::Adapter {
                 u
             }
         });
+        let staging_memory_types = staging_memory_types(&mem_properties, valid_ash_memory_types);
 
         // Note that VK_EXT_debug_utils is an instance extension (enabled at the instance
         // level) but contains a few functions that can be loaded directly on the Device for a
@@ -3096,6 +3097,7 @@ impl super::Adapter {
             mem_allocator: Mutex::new(mem_allocator),
             desc_allocator: Mutex::new(desc_allocator),
             valid_ash_memory_types,
+            staging_memory_types,
             naga_options,
             #[cfg(feature = "renderdoc")]
             render_doc: Default::default(),
@@ -3668,4 +3670,101 @@ fn query_cooperative_matrix_properties(
         result.len()
     );
     result
+}
+
+/// Host-visible device-local heaps smaller than this are a fixed BAR aperture (no resizable
+/// BAR) rather than all of VRAM.
+const SMALL_BAR_HEAP_SIZE: vk::DeviceSize = 1 << 30;
+
+/// Memory types for staging buffers: `valid` without a small BAR aperture, which some drivers
+/// make very slow to write through as it fills, if other host-visible memory exists.
+fn staging_memory_types(properties: &vk::PhysicalDeviceMemoryProperties, valid: u32) -> u32 {
+    let heaps = properties.memory_heaps_as_slice();
+    let types = properties.memory_types_as_slice();
+    let mask = |keep: &dyn Fn(&vk::MemoryType) -> bool| {
+        types
+            .iter()
+            .enumerate()
+            .filter(|&(_, ty)| keep(ty))
+            .fold(0u32, |mask, (i, _)| mask | (1 << i))
+            & valid
+    };
+    let window = mask(&|ty| {
+        ty.property_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            && heaps
+                .get(ty.heap_index as usize)
+                .is_some_and(|heap| heap.size < SMALL_BAR_HEAP_SIZE)
+    });
+    let host = mask(&|ty| {
+        ty.property_flags.contains(
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    });
+    if window != 0 && host & !window != 0 {
+        valid & !window
+    } else {
+        valid
+    }
+}
+
+#[cfg(test)]
+mod staging_memory_tests {
+    use ash::vk;
+
+    use super::staging_memory_types;
+
+    const DEVICE: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    const HOST: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
+        vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
+            | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
+    );
+
+    fn properties(bar_heap_size: vk::DeviceSize) -> vk::PhysicalDeviceMemoryProperties {
+        let mut properties = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 3,
+            memory_heap_count: 3,
+            ..Default::default()
+        };
+        properties.memory_heaps[0] = vk::MemoryHeap {
+            size: 12 << 30,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+        properties.memory_heaps[1] = vk::MemoryHeap {
+            size: 32 << 30,
+            flags: vk::MemoryHeapFlags::empty(),
+        };
+        properties.memory_heaps[2] = vk::MemoryHeap {
+            size: bar_heap_size,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+        properties.memory_types[0] = vk::MemoryType {
+            property_flags: DEVICE,
+            heap_index: 0,
+        };
+        properties.memory_types[1] = vk::MemoryType {
+            property_flags: HOST,
+            heap_index: 1,
+        };
+        properties.memory_types[2] = vk::MemoryType {
+            property_flags: DEVICE | HOST,
+            heap_index: 2,
+        };
+        properties
+    }
+
+    #[test]
+    fn small_bar_excluded() {
+        assert_eq!(staging_memory_types(&properties(256 << 20), 0b111), 0b011);
+    }
+
+    #[test]
+    fn resizable_bar_unchanged() {
+        assert_eq!(staging_memory_types(&properties(12 << 30), 0b111), 0b111);
+    }
+
+    #[test]
+    fn small_bar_kept_without_host_memory() {
+        assert_eq!(staging_memory_types(&properties(256 << 20), 0b101), 0b101);
+    }
 }

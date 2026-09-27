@@ -1039,6 +1039,11 @@ impl crate::Device for super::Device {
             (false, true) => gpu_allocator::MemoryLocation::CpuToGpu,
             (false, false) => gpu_allocator::MemoryLocation::GpuOnly,
         };
+        requirements.memory_type_bits &= if is_staging(desc.usage) {
+            self.staging_memory_types
+        } else {
+            self.valid_ash_memory_types
+        };
 
         self.error_if_would_oom_on_resource_allocation(location, &requirements)
             .inspect_err(|_| {
@@ -1062,10 +1067,7 @@ impl crate::Device for super::Device {
             .lock()
             .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
                 name,
-                requirements: vk::MemoryRequirements {
-                    memory_type_bits: requirements.memory_type_bits & self.valid_ash_memory_types,
-                    ..requirements
-                },
+                requirements,
                 location,
                 linear: true, // Buffers are always linear
                 allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
@@ -3185,4 +3187,43 @@ impl super::DeviceShared {
 struct ImageWithoutMemory {
     raw: vk::Image,
     requirements: vk::MemoryRequirements,
+}
+
+/// Whether a buffer is only written by the CPU and copied from by the GPU. `COPY_DST` is
+/// allowed because wgpu-core adds it to buffers not mapped at creation.
+fn is_staging(usage: wgt::BufferUses) -> bool {
+    use wgt::BufferUses as Bu;
+    usage.contains(Bu::MAP_WRITE) && (Bu::MAP_WRITE | Bu::COPY_SRC | Bu::COPY_DST).contains(usage)
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use wgt::BufferUses as Bu;
+
+    use super::is_staging;
+
+    #[test]
+    fn staging_usages() {
+        assert!(is_staging(Bu::MAP_WRITE));
+        assert!(is_staging(Bu::MAP_WRITE | Bu::COPY_SRC));
+        assert!(is_staging(Bu::MAP_WRITE | Bu::COPY_SRC | Bu::COPY_DST));
+    }
+
+    #[test]
+    fn non_staging_usages() {
+        for primary in [
+            Bu::VERTEX,
+            Bu::INDEX,
+            Bu::UNIFORM,
+            Bu::STORAGE_READ_ONLY,
+            Bu::STORAGE_READ_WRITE,
+            Bu::INDIRECT,
+        ] {
+            assert!(!is_staging(Bu::MAP_WRITE | Bu::COPY_SRC | primary));
+            assert!(!is_staging(Bu::MAP_WRITE | Bu::COPY_DST | primary));
+        }
+        assert!(!is_staging(Bu::MAP_READ | Bu::COPY_DST));
+        assert!(!is_staging(Bu::MAP_READ | Bu::MAP_WRITE | Bu::COPY_SRC));
+        assert!(!is_staging(Bu::COPY_SRC | Bu::COPY_DST));
+    }
 }
