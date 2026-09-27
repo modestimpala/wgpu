@@ -42,6 +42,12 @@ Bottom level categories:
 
 ## Unreleased
 
+### Bug Fixes
+
+#### Vulkan
+
+- Place staging buffers in host memory instead of a small (non-resizable) BAR heap, which could make uploads very slow on NVIDIA's Linux driver as it filled. By @modestimpala in [#TBD](https://github.com/gfx-rs/wgpu/pull/TBD).
+
 ## v30.0.1 (2026-08-21)
 
 ### Bug Fixes
